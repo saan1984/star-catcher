@@ -1,0 +1,1230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Star Catcher</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #070a18; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script src="config.js"></script>
+<script>
+(() => {
+  'use strict';
+  const CFG = Object.assign({ platform: 'web' }, window.GAME_CONFIG || {});
+  const AUTOSTART = CFG.platform === 'crazygames';   // CrazyGames asks to land new players straight in gameplay
+  const IN_PLAYABLES = !!window.ytgame;           // YouTube Playables: no ads / purchases allowed
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  // Logical size: the field is 720 tall and either 480 wide (portrait phones) or 1280 wide (16:9 landscape:
+  // desktop, tablets, phones held sideways). Menus are always a 480-wide column centred in the field.
+  const UW = 480, H = 720, LAND_W = 1280;
+  let FW = 480;                     // real field width right now
+  let W = 480;                      // "current" width: equals FW, except while a menu screen is drawn (then UW)
+  let wantFW = 480, layoutInit = false, uiDx = 0;
+  let scale = 1, ox = 0, oy = 0;
+
+  function fit() {
+    scale = Math.min(canvas.width / FW, canvas.height / H) || 1;
+    ox = (canvas.width - FW * scale) / 2;
+    oy = (canvas.height - H * scale) / 2;
+  }
+  // The Playables WebView can report 0x0 at first, so always fall back to a logical size.
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth || UW, h = window.innerHeight || H;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    wantFW = (w / h) >= 1.2 ? LAND_W : UW;
+    if (!layoutInit) { FW = W = wantFW; layoutInit = true; }
+    fit();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ======================================================================
+  //  Save data
+  // ======================================================================
+  const SAVE_KEY = 'starcatcher_v2';
+  const defaults = () => ({
+    best: 0, stardust: 0, totalStars: 0, games: 0, bestCombo: 0,
+    skin: 'classic', owned: ['classic'], music: true, sfx: true, seenTutorial: false, missions: null,
+    gear: { blaster: 1, magnet: 0, shield: 0, plating: 0 },
+    playSec: 0, unlocked: false, gift: '',
+  });
+  // A platform can provide its own storage (CrazyGames data module = cloud saves); otherwise localStorage.
+  const provStore = () => { try { return (!IN_PLAYABLES && window.GameMonetization && window.GameMonetization.storage) || null; } catch (e) { return null; } };
+  const storeGet = k => { const ps = provStore(); if (ps) { try { return ps.getItem(k); } catch (e) {} } return localStorage.getItem(k); };
+  const storeSet = (k, v) => { const ps = provStore(); if (ps) { try { ps.setItem(k, v); return; } catch (e) {} } localStorage.setItem(k, v); };
+  function loadSave() {
+    try {
+      const raw = storeGet(SAVE_KEY);
+      const d = Object.assign(defaults(), raw ? JSON.parse(raw) : {});
+      d.gear = Object.assign(defaults().gear, d.gear || {});
+      if (!raw) { const old = +localStorage.getItem('starcatcher_best'); if (old) d.best = old; }   // v1 migration
+      return d;
+    } catch (e) { return defaults(); }
+  }
+  let save = loadSave();
+  function persist() { try { storeSet(SAVE_KEY, JSON.stringify(save)); } catch (e) {} }
+
+  // ======================================================================
+  //  Monetization (inert unless a provider is plugged in; never on Playables)
+  // ======================================================================
+  // Provider interface (all optional): rewarded(placement, done(ok)), interstitial(done),
+  // loadingFinished(), gameplayStart(), gameplayStop(), managesPacing (provider decides when ads show).
+  const Money = {
+    adActive: false,                                  // true while an ad plays: our audio is muted
+    busy: false,                                      // an ad request is in flight: taps are ignored (progress is blocked until it ends)
+    get provider() { return IN_PLAYABLES ? null : window.GameMonetization || null; },
+    life(name) { const p = this.provider; if (p && p[name]) try { p[name](); } catch (e) { console.warn(e); } },
+    // Some platforms (CrazyGames) have their own mute setting that beats our toggles.
+    platformMuted() { const p = this.provider; try { return !!(p && p.muted && p.muted()); } catch (e) { return false; } },
+    // Hidden when the provider says rewards are unavailable (e.g. Poki with an ad blocker: no rewards then).
+    canRewarded() { const p = this.provider; return !!(p && p.rewarded && (!p.rewardedAvailable || p.rewardedAvailable())); },
+    // One-time unlock after the free trial. purchase(id, done(ok)), restore(done(ok)), price(id) -> localized string.
+    canPurchase() { const p = this.provider; return !!(p && p.purchase); },
+    purchase(id, done) { const p = this.provider; if (p && p.purchase) p.purchase(id, ok => done(!!ok)); else done(false); },
+    restore(done) { const p = this.provider; if (p && p.restore) p.restore(ok => done(!!ok)); else done(false); },
+    price(id) { const p = this.provider; try { return p && p.price ? p.price(id) || '' : ''; } catch (e) { return ''; } },
+    // Runs one provider ad call: UI locked meanwhile, `done` fires exactly once (a watchdog covers a provider that never answers).
+    // Providers with ownsAdAudio mute themselves only when the ad really starts, by calling ctl.muted(true/false).
+    _ad(run, done) {
+      const p = this.provider; let over = false, wd = 0;
+      const ctl = { muted: v => { this.adActive = !!v; } };
+      const end = ok => { if (over) return; over = true; clearTimeout(wd); this.busy = false; this.adActive = false; done(ok); };
+      this.busy = true; this.adActive = !p.ownsAdAudio;
+      wd = setTimeout(() => end(false), 60000);
+      try { run(p, end, ctl); } catch (e) { console.warn(e); end(false); }
+    },
+    rewarded(placement, onReward) {
+      const p = this.provider; if (!p || !p.rewarded || this.busy) return;
+      this._ad((pp, end, ctl) => pp.rewarded(placement, end, ctl), ok => { if (ok) onReward(); });
+    },
+    // Android-style pacing: every 3rd finished game (after the first 3), unless ads were removed.
+    // Providers with managesPacing (Poki, CrazyGames) are asked at every retry and decide themselves.
+    // Ads only run between a finished game and the retry, never when starting from the menu.
+    interstitialThen(cb, fromMenu) {
+      const p = this.provider;
+      if (this.busy) return;
+      if (!p || !p.interstitial || save.noAds || fromMenu) return cb();
+      if (p.managesPacing || (save.games >= 3 && save.games % 3 === 0)) this._ad((pp, end, ctl) => pp.interstitial(() => end(true), ctl), () => cb());
+      else cb();
+    },
+  };
+
+  // ----- free trial: play N minutes for free, then a one-time unlock (only where a purchase provider exists) -----
+  const TRIAL_MIN = IN_PLAYABLES || CFG.platform === 'poki' || CFG.platform === 'crazygames' ? 0 : (+CFG.trialMinutes || 0);
+  const UNLOCK_URL = CFG.unlockUrl || '';                       // web: where the full game is sold
+  const trialOn = () => TRIAL_MIN > 0 && !save.unlocked && (Money.canPurchase() || !!UNLOCK_URL);
+  const trialLeft = () => Math.max(0, TRIAL_MIN * 60 - save.playSec);
+  const locked = () => trialOn() && trialLeft() <= 0;
+  const mmss = s => Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+
+  // ======================================================================
+  //  Assets
+  // ======================================================================
+  const IMG = {};
+  const sources = {
+    bg1: 'assets/bg1.jpg', bg2: 'assets/bg2.jpg', bg3: 'assets/bg3.jpg',
+    bg1l: 'assets/bg1_l.jpg', bg2l: 'assets/bg2_l.jpg', bg3l: 'assets/bg3_l.jpg',
+    star: 'assets/star.png', rock: 'assets/rock.png', boss: 'assets/boss.png',
+    catcher: 'assets/catcher.png', skin_pink: 'assets/skin_pink.png',
+    skin_emerald: 'assets/skin_emerald.png', skin_gold: 'assets/skin_gold.png',
+    gear_blaster: 'assets/gear_blaster.png', gear_magnet: 'assets/gear_magnet.png',
+    gear_shield: 'assets/gear_shield.png', gear_plating: 'assets/gear_plating.png',
+  };
+  const loaded = Promise.all(Object.entries(sources).map(([k, src]) => new Promise(res => {
+    const im = new Image();
+    im.onload = () => { IMG[k] = im; res(); };
+    im.onerror = () => res();                       // shapes are drawn if an image is missing
+    im.src = src;
+  }))).then(() => ['catcher', 'skin_pink', 'skin_emerald', 'skin_gold', 'boss', 'gear_blaster', 'gear_magnet', 'gear_shield', 'gear_plating'].forEach(trim));
+
+  // Crop a sprite's transparent margin so its size and position are exact.
+  function trim(key) {
+    const im = IMG[key]; if (!im) return;
+    try {
+      const c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+      const x = c.getContext('2d'); x.drawImage(im, 0, 0);
+      const d = x.getImageData(0, 0, c.width, c.height).data;
+      let x0 = c.width, y0 = c.height, x1 = 0, y1 = 0;
+      for (let y = 0; y < c.height; y++) for (let xx = 0; xx < c.width; xx++) {
+        if (d[(y * c.width + xx) * 4 + 3] > 12) { if (xx < x0) x0 = xx; if (xx > x1) x1 = xx; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      }
+      const w = x1 - x0 + 1, h = y1 - y0 + 1;
+      const t = document.createElement('canvas'); t.width = w; t.height = h;
+      t.getContext('2d').drawImage(c, x0, y0, w, h, 0, 0, w, h);
+      IMG[key] = t;
+    } catch (e) { /* keep untrimmed */ }
+  }
+
+  const SKINS = [
+    { id: 'classic', name: 'Classic', img: 'catcher', price: 0, rim: 0.14 },
+    { id: 'pink', name: 'Neon Pink', img: 'skin_pink', price: 150, rim: 0.14 },
+    { id: 'emerald', name: 'Aurora', img: 'skin_emerald', price: 350, rim: 0.14 },
+    { id: 'gold', name: 'Royal Gold', img: 'skin_gold', price: 700, rim: 0.22 },
+  ];
+  const bgFor = n => (FW > UW && IMG['bg' + n + 'l']) || IMG['bg' + n];       // landscape art when the field is wide
+  const skinById = id => SKINS.find(s => s.id === id) || SKINS[0];
+  const curSkin = () => skinById(save.skin);
+
+  // Equipment: upgraded in the GEAR screen with stardust, carried on the robot.
+  const GEAR = [
+    { id: 'blaster', name: 'Star Blaster', img: 'gear_blaster', color: '#ffb02e', costs: [0, 120, 300],
+      fx: ['', 'Single bolt', 'Twin bolts, faster', 'Triple spread, fastest'] },
+    { id: 'magnet', name: 'Magnet Coil', img: 'gear_magnet', color: '#ff7a5c', costs: [80, 200, 400],
+      fx: ['Not installed', 'Always pulls nearby stars', 'Wider pull, longer pulse', 'Huge pull, longest pulse'] },
+    { id: 'shield', name: 'Shield Core', img: 'gear_shield', color: '#7be7ff', costs: [80, 200, 400],
+      fx: ['Basic shield', 'Shield lasts +1.5s', '+3s, start with 2 charges', '+4.5s, start with 2 charges'] },
+    { id: 'plating', name: 'Heart Plating', img: 'gear_plating', color: '#ff7aa2', costs: [150, 350, 600],
+      fx: ['3 lives', 'Start with 4 lives', 'Start with 5 lives', 'Start with 6 lives'] },
+  ];
+  const gl = id => save.gear[id] || 0;
+  const MAX_LIVES = 6, MAX_CHARGES = 4;
+
+  // Every level plays differently. Levels cycle through these 10 types (harder each lap).
+  // rock/comet/big/orb scale spawn chances, speed scales fall speed, rate scales spawn pace,
+  // wind pushes items sideways, rockHp makes meteors tougher, event adds a shower or a boss.
+  const LEVEL_TYPES = [
+    { name: 'Calm Orbit',     tip: 'Warm up and catch the stars',       rock: 0.6, comet: 0,    big: 0,    orb: 1,   speed: 1,    rate: 1,   wind: 0,  rockHp: 0, bg: 1 },
+    { name: 'Star Rain',      tip: 'Stars everywhere. Build a combo!',  rock: 0.35, comet: 0,   big: 0.10, orb: 1,   speed: 0.95, rate: 0.7, wind: 0,  rockHp: 0, bg: 1 },
+    { name: 'Meteor Shower',  tip: 'Find the safe lane',                rock: 1,   comet: 0,    big: 0,    orb: 1,   speed: 1,    rate: 1,   wind: 0,  rockHp: 0, bg: 2, event: 'shower' },
+    { name: 'Comet Run',      tip: 'Fast comets: stay sharp',           rock: 0.7, comet: 0.18, big: 0.02, orb: 1,   speed: 1,    rate: 1,   wind: 0,  rockHp: 0, bg: 2 },
+    { name: 'Meteor Titan',   tip: 'Boss fight: shoot it down!',        rock: 0.8, comet: 0,    big: 0,    orb: 1,   speed: 1,    rate: 1,   wind: 0,  rockHp: 0, bg: 3, event: 'boss' },
+    { name: 'Power Drift',    tip: 'Extra power orbs. Grab them!',      rock: 0.9, comet: 0,    big: 0.04, orb: 3,   speed: 1,    rate: 1,   wind: 0,  rockHp: 0, bg: 1 },
+    { name: 'Asteroid Field', tip: 'Big slow rocks. Blast them!',       rock: 1.5, comet: 0,    big: 0,    orb: 1.2, speed: 0.75, rate: 1,   wind: 0,  rockHp: 2, bg: 2 },
+    { name: 'Solar Wind',     tip: 'The wind pushes everything',        rock: 1,   comet: 0.05, big: 0.03, orb: 1.5, speed: 1,    rate: 1,   wind: 80, rockHp: 0, bg: 3 },
+    { name: 'Meteor Storm',   tip: 'A bigger shower: hold the lane',    rock: 1,   comet: 0,    big: 0,    orb: 1,   speed: 1,    rate: 1,   wind: 0,  rockHp: 0, bg: 3, event: 'shower' },
+    { name: 'Titan Returns',  tip: 'A tougher boss',                    rock: 0.8, comet: 0,    big: 0,    orb: 1,   speed: 1,    rate: 1,   wind: 0,  rockHp: 0, bg: 2, event: 'boss' },
+  ];
+  const lvType = n => LEVEL_TYPES[(n - 1) % LEVEL_TYPES.length];
+
+  // ======================================================================
+  //  Audio: bundled music + synthesised effects
+  // ======================================================================
+  let musicUnlocked = false;
+  const music = new Audio('assets/music.mp3');
+  music.loop = true; music.preload = 'auto'; music.volume = 0;
+  function syncMusic() {
+    const should = musicUnlocked && save.music && !document.hidden && state !== 'paused' && !Money.adActive && !Money.platformMuted();
+    const target = should ? (state === 'playing' || state === 'dying' ? 0.38 : 0.24) : 0;
+    music.volume += (target - music.volume) * 0.08;
+    if (Math.abs(target - music.volume) < 0.005) music.volume = target;
+    if (should && music.paused) { const p = music.play(); p && p.catch(() => {}); }
+    else if (!should && !music.paused && music.volume === 0) music.pause();
+  }
+  function unlockAudio() {
+    if (!musicUnlocked) { musicUnlocked = true; const p = music.play(); p && p.catch(() => { musicUnlocked = false; }); }
+    audioCtx();
+  }
+  let actx = null;
+  function audioCtx() {
+    if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (actx && actx.state === 'suspended') actx.resume();
+    return actx;
+  }
+  function beep(freq, dur, type = 'sine', vol = 0.12, slide = 0, delay = 0) {
+    if (!save.sfx || Money.adActive || Money.platformMuted()) return;
+    const a = audioCtx(); if (!a) return;
+    const t0 = a.currentTime + delay;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t0);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t0 + dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(t0); o.stop(t0 + dur);
+  }
+  const sfx = {
+    click: () => beep(600, 0.06, 'triangle', 0.08),
+    catch: c => beep(520 + Math.min(c, 14) * 55, 0.14, 'triangle', 0.14),
+    big: () => { beep(784, 0.12, 'triangle', 0.15); beep(1047, 0.2, 'triangle', 0.15, 0, 0.08); },
+    power: () => { beep(660, 0.1, 'sine', 0.14); beep(880, 0.16, 'sine', 0.14, 0, 0.09); },
+    hit: () => beep(140, 0.35, 'sawtooth', 0.18, -90),
+    level: () => [523, 659, 784, 1047].forEach((f, i) => beep(f, 0.18, 'triangle', 0.14, 0, i * 0.08)),
+    warn: () => { beep(330, 0.25, 'square', 0.08); beep(330, 0.25, 'square', 0.08, 0, 0.35); },
+    over: () => beep(300, 0.6, 'square', 0.12, -220),
+    buy: () => [660, 880, 1175].forEach((f, i) => beep(f, 0.14, 'triangle', 0.14, 0, i * 0.07)),
+    deny: () => beep(180, 0.18, 'square', 0.1),
+    start: () => { beep(440, 0.1, 'triangle'); beep(660, 0.18, 'triangle', 0.12, 0, 0.1); },
+    pew: () => beep(980, 0.09, 'square', 0.05, -620),
+    boom: () => { beep(110, 0.22, 'sawtooth', 0.12, -60); beep(220, 0.1, 'square', 0.06, -120); },
+    magnet: () => { beep(240, 0.5, 'sine', 0.12, 420); beep(480, 0.4, 'triangle', 0.07, 300, 0.08); },
+    shield: () => { beep(520, 0.3, 'triangle', 0.12, 360); },
+    titan: () => [196, 165, 131].forEach((f, i) => beep(f, 0.4, 'sawtooth', 0.12, -30, i * 0.18)),
+  };
+  function vibrate(ms) { if (save.sfx && navigator.vibrate && !IN_PLAYABLES) try { navigator.vibrate(ms); } catch (e) {} }
+
+  // ======================================================================
+  //  Daily missions
+  // ======================================================================
+  const MISSION_TYPES = [
+    { type: 'stars', mode: 'sum', targets: [40, 60, 90], reward: 40, text: n => `Catch ${n} stars` },
+    { type: 'combo', mode: 'max', targets: [10, 15, 20], reward: 50, text: n => `Chain ${n} stars in a row` },
+    { type: 'level', mode: 'max', targets: [3, 4, 5], reward: 60, text: n => `Reach level ${n}` },
+    { type: 'time', mode: 'max', targets: [60, 90, 120], reward: 50, text: n => `Survive ${n} seconds` },
+    { type: 'power', mode: 'sum', targets: [3, 5, 8], reward: 40, text: n => `Collect ${n} power-ups` },
+    { type: 'bigs', mode: 'sum', targets: [2, 3, 4], reward: 60, text: n => `Catch ${n} bonus stars` },
+    { type: 'kills', mode: 'sum', targets: [8, 12, 20], reward: 50, text: n => `Blast ${n} meteors` },
+  ];
+  const today = () => { const d = new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); };
+  function seededRng(str) {
+    let h = 1779033703 ^ str.length;
+    for (let i = 0; i < str.length; i++) { h = Math.imul(h ^ str.charCodeAt(i), 3432918353); h = (h << 13) | (h >>> 19); }
+    return () => { h = Math.imul(h ^ (h >>> 16), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); return ((h ^= h >>> 16) >>> 0) / 4294967296; };
+  }
+  function ensureMissions() {
+    const d = today();
+    if (save.missions && save.missions.date === d) return;
+    const rnd = seededRng('sc' + d);
+    const pool = MISSION_TYPES.slice().sort(() => rnd() - 0.5).slice(0, 3);
+    save.missions = { date: d, list: pool.map(m => ({ type: m.type, target: m.targets[Math.floor(rnd() * 3)], reward: m.reward, progress: 0, done: false })) };
+    persist();
+  }
+  function missionEvent(type, value) {
+    if (!save.missions) return;
+    for (const m of save.missions.list) {
+      if (m.type !== type || m.done) continue;
+      const def = MISSION_TYPES.find(x => x.type === type);
+      m.progress = def.mode === 'sum' ? m.progress + value : Math.max(m.progress, value);
+      if (m.progress >= m.target) {
+        m.done = true; m.progress = m.target; save.stardust += m.reward; persist();
+        banner('Mission complete!', '+' + m.reward + ' stardust', '#ffd166');
+        sfx.level();
+      }
+    }
+  }
+
+  // ======================================================================
+  //  Game state
+  // ======================================================================
+  const PLAYER_Y = H - 165;                             // leaves the bottom strip for the action buttons
+  const player = { x: W / 2, y: PLAYER_Y, h: 130, vx: 0 };
+  const playerImg = () => IMG[curSkin().img];
+  const pw = () => { const c = playerImg(); return c ? player.h * c.width / c.height : 110; };
+  let state = 'loading';       // loading | menu | shop | gear | missions | playing | paused | dying | over
+  let items = [], parts = [], pops = [], banners = [], bolts = [];
+  let score = 0, lives = 3, combo = 0, level = 1, shake = 0, flash = 0;
+  let shield = 0, magnet = 0, slow = 0, startT = 0, dyingT = 0, overT = 0;
+  let magnetCh = 0, shieldCh = 0, energy = 100, overheat = false, fireT = 0, muzzle = 0;
+  let run = null, ev = null, boss = null, playSaveT = 0;
+  let spawnT = 0, t = 0, bgY = 0, bgCur = 1, bgPrev = 1, bgFade = 1;
+  let lastRewardOffer = -1e9;                       // rewarded offers are rationed: not on every death
+  let tutMoved = true, tutFired = true;                 // onboarding progress: have they moved / fired yet?
+  const COARSE = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);   // touch screen?
+  let earned = 0, newBest = false, canRevive = false, denyShake = 0, hintT = 0, shopDeny = '', gearDeny = '';
+  const keys = {};
+  let pointerX = null, moveId = null, fireId = null, fireHeld = false, fireFromButton = false, pressedKey = null;
+  let ui = [];
+  const bgStars = Array.from({ length: 40 }, () => ({ x: Math.random() * W, y: Math.random() * H, z: 0.3 + Math.random() }));
+  const mult = () => Math.min(5, 1 + Math.floor(combo / 5));
+  const dens = () => Math.pow(UW / W, 0.7);                       // a wider field spawns proportionally more items
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  // ability tuning (all driven by equipment level)
+  const magnetDur = () => 5 + gl('magnet') * 1.5;
+  const magnetRadius = () => 230 + gl('magnet') * 25;
+  const passiveRadius = () => gl('magnet') > 0 ? 40 + gl('magnet') * 45 : 0;
+  const shieldDur = () => 4 + gl('shield') * 1.5;
+  const fireInterval = () => [0.30, 0.30, 0.24, 0.19][gl('blaster')] || 0.3;
+
+  function startRun() {
+    ensureMissions();
+    items = []; parts = []; pops = []; banners = []; bolts = [];
+    score = 0; lives = Math.min(MAX_LIVES, 3 + gl('plating')); combo = 0; level = 1;
+    shield = 0; magnet = 0; slow = 0; ev = null; boss = null;
+    magnetCh = 1; shieldCh = 1 + (gl('shield') >= 2 ? 1 : 0);
+    const gift = save.gift !== today();                 // free daily gift: +1 magnet and +1 shield on the first run of the day
+    if (gift) { save.gift = today(); magnetCh = Math.min(MAX_CHARGES, magnetCh + 1); shieldCh = Math.min(MAX_CHARGES, shieldCh + 1); persist(); }
+    energy = 100; overheat = false; fireT = 0; muzzle = 0; fireHeld = false;
+    spawnT = 0.6; startT = 1.0; bgCur = bgPrev = 1; bgFade = 1; earned = 0; newBest = false;
+    run = { stars: 0, bigs: 0, power: 0, kills: 0, maxCombo: 0, time: 0, revived: false, awarded: 0, titans: 0 };
+    player.x = W / 2; player.vx = 0;
+    const first = !save.seenTutorial;                          // short, visual, skippable tutorial for new players only
+    hintT = first ? 16 : 0; tutMoved = tutFired = !first;
+    save.seenTutorial = true;
+    state = 'playing';
+    sfx.start();
+    banner('LEVEL 1', lvType(1).name + ': ' + lvType(1).tip, '#7be7ff');
+    if (gift) banner('DAILY GIFT', '+1 magnet and +1 shield', '#ffd166');
+  }
+
+  // Free ways to earn charges: combos, clearing levels, blasting meteors, bosses and the daily gift.
+  // A full stock converts into a few stardust so nothing is wasted.
+  function grantCharge(type, why) {
+    const isMag = type === 'magnet', col = isMag ? '#ffb347' : '#7be7ff';
+    if ((isMag ? magnetCh : shieldCh) >= MAX_CHARGES) {
+      save.stardust += 5; earned += 5; pop(player.x, player.y - 110, '+5 ✦ (stock full)', '#ffd166'); return;
+    }
+    if (isMag) magnetCh++; else shieldCh++;
+    pop(player.x, player.y - 110, '+1 ' + type.toUpperCase() + '  (' + why + ')', col);
+    burst(player.x, player.y - 60, col, 14); sfx.power();
+  }
+  function goto(s) { state = s; sfx.click(); if (s === 'missions') ensureMissions(); }
+
+  // ----- abilities (the on-screen buttons) -----
+  function useMagnet() {
+    if (state !== 'playing' || startT > 0) return;
+    if (magnetCh <= 0) { sfx.deny(); return; }
+    magnetCh--; magnet = magnetDur(); sfx.magnet(); vibrate(20);
+    banner('MAGNET!', 'Stars fly to you', '#ff9a6b');
+  }
+  function useShield() {
+    if (state !== 'playing' || startT > 0) return;
+    if (shieldCh <= 0) { sfx.deny(); return; }
+    shieldCh--; shield = shieldDur(); sfx.shield(); vibrate(20);
+  }
+
+  // ----- spawning -----
+  function spawn() {
+    const lt = lvType(level);                                   // each level type changes what falls and how
+    const base = Math.min(420, 150 + level * 20) * lt.speed;
+    const v = base + rand(0, 90);
+    const roll = Math.random();
+    let kind = 'star', x = rand(30, W - 30), c = 0;
+    const rockP = Math.min(0.38, 0.2 + level * 0.015) * lt.rock;
+    const cometP = (level >= 3 ? 0.07 : 0) * (lt.comet ? 0 : 1) + lt.comet;
+    const orbP = 0.06 * lt.orb, bigP = (level >= 2 ? 0.04 : 0) + lt.big;
+    if (roll < (c += rockP)) kind = 'rock';
+    else if (roll < (c += cometP)) kind = 'comet';
+    else if (roll < (c += 0.025) && lives < MAX_LIVES) kind = 'heart';
+    else if (roll < (c += orbP)) kind = ['shield', 'magnet', 'shield', 'magnet', 'slow'][Math.floor(Math.random() * 5)];
+    else if (roll < (c += bigP)) kind = 'big';
+    const r = kind === 'rock' ? rand(24, 34) : kind === 'comet' ? 16 : kind === 'big' ? 30 : kind === 'star' ? 24 : 22;
+    const hp = kind === 'rock' ? Math.max(lt.rockHp, r >= 30 ? 2 : 1) : 1;
+    const vx = lt.wind ? Math.sin(run.time * 0.5) * lt.wind : 0;      // Solar Wind: items drift with a slow gust
+    items.push({ kind, x, y: -40, v: kind === 'comet' ? 470 + level * 8 : v, vx, r, hp, rot: rand(0, 6.28), vr: rand(-2.5, 2.5) });
+  }
+  function spawnShowerItem() {
+    // Rocks everywhere except a safe lane that drifts; stars appear inside the lane.
+    ev.lane += rand(-60, 60); ev.lane = Math.max(110, Math.min(W - 110, ev.lane));
+    if (Math.random() < 0.22) { items.push({ kind: 'star', x: ev.lane + rand(-50, 50), y: -40, v: 230, vx: 0, r: 24, hp: 1, rot: 0, vr: 0 }); return; }
+    let x = rand(30, W - 30), tries = 0;
+    while (Math.abs(x - ev.lane) < 95 && tries++ < 8) x = rand(30, W - 30);
+    if (Math.abs(x - ev.lane) < 95) return;
+    items.push({ kind: 'rock', x, y: -40, v: 330 + level * 12 + rand(0, 80), vx: 0, r: rand(22, 30), hp: 1, rot: rand(0, 6.28), vr: rand(-3, 3) });
+  }
+  function spawnBoss() {
+    const n = Math.floor(level / 5);
+    const hp = 16 + 8 * n;
+    boss = { x: W / 2, y: -150, ty: 220, r: 78, hp, max: hp, dir: 1, fireT: 1.6, shots: 0, life: 26, flash: 0, leaving: false };
+    sfx.titan(); banner('METEOR TITAN', 'Shoot it down!', '#ff8a8a'); shake = 10;
+  }
+  function killBoss() {
+    const b = boss; boss = null; run.titans++;
+    burst(b.x, b.y, '#ffb347', 60, 420); burst(b.x, b.y, '#ffffff', 30, 300);
+    score += 50; save.stardust += 40; earned += 40; shake = 18; flash = 0.6;
+    for (let i = 0; i < 3; i++) items.push({ kind: 'big', x: b.x + (i - 1) * 60, y: b.y, v: 150, vx: 0, r: 30, hp: 1, rot: 0, vr: 0 });
+    banner('TITAN DOWN!', '+50 score  +40 stardust  +1 magnet  +1 shield', '#ffd166'); sfx.level(); sfx.boom(); vibrate(120);
+    grantCharge('magnet', 'boss'); grantCharge('shield', 'boss'); Money.life('happytime');
+  }
+
+  function banner(text, sub, color) { banners.push({ text, sub, color: color || '#fff', life: 1.8, max: 1.8 }); }
+  function burst(x, y, color, n, speed = 220) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * 6.283, s = rand(speed * 0.3, speed);
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.4, 0.9), max: 0.9, c: color, r: rand(2, 5) });
+    }
+  }
+  function pop(x, y, text, color) { pops.push({ x, y, text, color, life: 0.8 }); }
+
+  // ----- the blaster -----
+  function fireVolley() {
+    const lv = gl('blaster'), off = pw() * 0.5, y = player.y - player.h * 0.2;
+    const shots = lv >= 3 ? [[-off * 0.7, -90], [0, 0], [off * 0.7, 90]] : lv === 2 ? [[-off * 0.55, 0], [off * 0.55, 0]] : [[0, 0]];
+    for (const [dx, vx] of shots) bolts.push({ x: player.x + dx, y, vx, vy: -820, dmg: 1 });
+    muzzle = 0.08; sfx.pew(); tutFired = true;
+  }
+  function updateBlaster(dtReal) {
+    fireT -= dtReal; muzzle = Math.max(0, muzzle - dtReal);
+    const want = (fireHeld || keys[' ']) && state === 'playing' && startT <= 0;
+    if (overheat && energy >= 35) overheat = false;
+    if (want && !overheat && fireT <= 0) {
+      if (energy >= 9) { fireVolley(); energy -= 9; fireT = fireInterval(); if (energy < 9) { overheat = true; sfx.deny(); } }
+    }
+    energy = Math.min(100, energy + (want && !overheat ? 12 : 28) * dtReal);
+  }
+  function updateBolts(dt) {
+    for (const b of bolts) {
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      if (boss && !boss.leaving && Math.abs(b.x - boss.x) < boss.r * 0.85 && Math.abs(b.y - boss.y) < boss.r * 0.8) {
+        b.dead = true; boss.hp -= b.dmg; boss.flash = 0.1; burst(b.x, b.y, '#ffb347', 5, 160);
+        if (boss.hp <= 0) { killBoss(); }
+        continue;
+      }
+      for (const it of items) {
+        if (it.dead || (it.kind !== 'rock' && it.kind !== 'comet')) continue;
+        if (Math.abs(it.x - b.x) < it.r * 1.05 && Math.abs(it.y - b.y) < it.r * 1.05) {
+          b.dead = true; it.hp -= b.dmg; burst(b.x, b.y, '#ffd9a0', 6, 170);
+          if (it.hp <= 0) {
+            it.dead = true; run.kills++; missionEvent('kills', 1); score += 2;
+            if (run.kills % 8 === 0) grantCharge((run.kills / 8) % 2 ? 'magnet' : 'shield', '8 blasts');   // free charge every 8 meteors
+            burst(it.x, it.y, '#ff8a4a', 22, 300); pop(it.x, it.y - 12, '+2', '#ffb347'); sfx.boom();
+            if (Math.random() < 0.18) items.push({ kind: 'star', x: it.x, y: it.y, v: 150, vx: 0, r: 24, hp: 1, rot: 0, vr: 0 });
+          }
+          break;
+        }
+      }
+    }
+    bolts = bolts.filter(b => !b.dead && b.y > -30);
+  }
+
+  // ----- the world step -----
+  function world(dtReal) {
+    const dying = state === 'dying';
+    const ts = dying ? 0.25 : slow > 0 ? 0.5 : 1;
+    const dt = dtReal * ts;
+    bgY = (bgY + dt * 30) % (2 * H);
+    if (bgFade < 1) bgFade = Math.min(1, bgFade + dtReal / 1.6);
+
+    if (dying) {
+      dyingT += dtReal; bolts = [];
+      for (const it of items) { it.y += it.v * dt; it.rot += it.vr * dt; }
+      if (dyingT > 1.2) finishRun();
+      return;
+    }
+
+    // movement (real time so slow-mo doesn't slow the player)
+    const prev = player.x;
+    if (pointerX !== null) player.x += (pointerX - player.x) * Math.min(1, dtReal * 18);
+    else {
+      const dir = (keys.ArrowRight || keys.KeyD ? 1 : 0) - (keys.ArrowLeft || keys.KeyA ? 1 : 0);
+      player.x += dir * 560 * Math.pow(W / UW, 0.6) * dtReal;
+    }
+    player.x = Math.max(pw() / 2, Math.min(W - pw() / 2, player.x));
+    if (Math.abs(player.x - W / 2) > 70) tutMoved = true;
+    player.vx += ((player.x - prev) / Math.max(dtReal, 0.001) - player.vx) * Math.min(1, dtReal * 10);
+
+    shield = Math.max(0, shield - dtReal); magnet = Math.max(0, magnet - dtReal); slow = Math.max(0, slow - dtReal);
+    hintT = Math.max(0, hintT - dtReal);
+    updateBlaster(dtReal);
+    if (startT > 0) { startT -= dtReal; return; }
+    run.time += dtReal; missionEvent('time', Math.floor(run.time));
+    save.playSec += dtReal;                                      // counts toward the free trial (real play time only)
+    if ((playSaveT += dtReal) > 10) { playSaveT = 0; persist(); }
+
+    // level progression
+    const newLevel = 1 + Math.floor(score / 25);
+    if (newLevel > level) {
+      level = newLevel; const lt = lvType(level); sfx.level(); vibrate(25);
+      banner('LEVEL ' + level, lt.name + ': ' + lt.tip, '#7be7ff');
+      missionEvent('level', level);
+      grantCharge(level % 2 === 0 ? 'magnet' : 'shield', 'level clear');       // free reward for clearing the last level
+      if (lt.bg !== bgCur) { bgPrev = bgCur; bgCur = lt.bg; bgFade = 0; }       // every level type has its own backdrop
+      if (lt.event === 'boss' && !boss && !ev) { ev = { phase: 'bosswarn', t: 2.4 }; sfx.warn(); }
+      else if (lt.event === 'shower' && !ev && !boss) { ev = { phase: 'warn', t: 2.2, lane: W / 2 }; sfx.warn(); }
+    }
+
+    // events
+    if (ev) {
+      ev.t -= dtReal;
+      if (ev.phase === 'warn' && ev.t <= 0) { ev.phase = 'on'; ev.t = lvType(level).name === 'Meteor Storm' ? 9.5 : 7; }
+      else if (ev.phase === 'on' && ev.t <= 0) { ev = null; banner('Shower over!', 'Nice dodging', '#ffd166'); }
+      else if (ev.phase === 'bosswarn' && ev.t <= 0) { ev = null; spawnBoss(); }
+    }
+
+    // boss behaviour
+    if (boss) {
+      const b = boss;
+      b.flash = Math.max(0, b.flash - dtReal);
+      if (b.leaving) { b.y -= 220 * dt; if (b.y < -200) boss = null; }
+      else {
+        b.y += (b.ty - b.y) * Math.min(1, dt * 2);
+        b.x += b.dir * 80 * dt; if (b.x > W - 90) b.dir = -1; if (b.x < 90) b.dir = 1;
+        b.life -= dtReal;
+        if (b.life <= 0) { b.leaving = true; banner('Titan retreats', '', '#b8c4d9'); }
+        b.fireT -= dt;
+        if (b.fireT <= 0 && b.y > 100) {
+          b.shots++;
+          const aim = Math.max(-140, Math.min(140, (player.x - b.x) * 0.35));
+          const fan = b.shots % 3 === 0 ? [-120, 0, 120] : [aim];
+          for (const vx of fan) items.push({ kind: 'rock', x: b.x, y: b.y + b.r * 0.7, v: 250 + level * 6, vx, r: 22, hp: 1, rot: 0, vr: rand(-3, 3) });
+          sfx.boom(); b.fireT = Math.max(0.75, 1.5 - level * 0.03);
+        }
+      }
+    }
+
+    // spawning
+    spawnT -= dt;
+    if (spawnT <= 0) {
+      if (ev && ev.phase === 'on') { spawnShowerItem(); spawnT = (lvType(level).name === 'Meteor Storm' ? 0.12 : 0.16) * dens(); }
+      else if (!(ev && (ev.phase === 'warn' || ev.phase === 'bosswarn'))) { spawn(); spawnT = Math.max(0.28, 0.85 - level * 0.05) * lvType(level).rate * (boss ? 1.8 : 1) * dens(); }
+      else spawnT = 0.2;
+    }
+
+    // engine trail
+    if (Math.random() < 0.7) parts.push({ x: player.x + rand(-20, 20), y: player.y + player.h / 2 - 8, vx: rand(-20, 20), vy: rand(80, 160), life: 0.4, max: 0.4, c: '#7be7ff', r: rand(2, 4) });
+
+    updateBolts(dt);
+
+    const sk = curSkin();
+    const catchY = player.y - player.h / 2 + player.h * sk.rim;
+    const halfW = pw() * 0.46;
+    const R = magnet > 0 ? magnetRadius() : passiveRadius(), pull = magnet > 0 ? 470 : 250;
+    for (const it of items) {
+      it.pulled = false;
+      if (R > 0 && ['star', 'big', 'heart', 'shield', 'magnet', 'slow'].includes(it.kind) && it.y > 20) {
+        const dx = player.x - it.x, dy = (catchY - 10) - it.y, d = Math.hypot(dx, dy) || 1;
+        if (d < R) { const sp = pull * (1 - 0.45 * d / R); it.x += dx / d * sp * dt; it.y += dy / d * sp * dt * 0.7; it.pulled = true; }
+      }
+      it.x += it.vx * dt; it.y += it.v * dt; it.rot += it.vr * dt;
+      const dx = it.x - player.x, dy = it.y - catchY;
+      if (Math.abs(dx) < halfW + it.r * 0.3 && Math.abs(dy) < 26 + it.r * 0.5) { it.dead = true; collect(it); if (state === 'dying') break; }
+      else if (it.y > H + 40 || it.x < -60 || it.x > W + 60) { it.dead = true; if (it.kind === 'star') combo = 0; }
+    }
+    items = items.filter(i => !i.dead);
+  }
+
+  function collect(it) {
+    const k = it.kind;
+    if (k === 'star' || k === 'big') {
+      combo++; run.maxCombo = Math.max(run.maxCombo, combo);
+      if (combo % 10 === 0) grantCharge((combo / 10) % 2 ? 'shield' : 'magnet', 'combo ' + combo);   // free charge every 10-chain
+      const m = mult(), gain = (k === 'big' ? 5 : 1) * m;
+      score += gain;
+      run.stars++; missionEvent('stars', 1); missionEvent('combo', combo);
+      if (k === 'big') { run.bigs++; missionEvent('bigs', 1); burst(it.x, it.y, '#fff3b0', 24, 300); pop(it.x, it.y - 12, '+' + gain, '#fff3b0'); sfx.big(); vibrate(15); }
+      else { burst(it.x, it.y, '#ffd166', 12); pop(it.x, it.y - 10, '+' + gain, '#ffd166'); sfx.catch(combo); }
+      if (combo > 0 && combo % 5 === 0) pop(player.x, player.y - 90, 'x' + m + ' combo!', '#ffd166');
+    } else if (k === 'heart' || k === 'shield' || k === 'magnet' || k === 'slow') {
+      run.power++; missionEvent('power', 1); sfx.power();
+      const info = { heart: ['+1 life', '#ff7aa2'], shield: ['+1 shield', '#7be7ff'], magnet: ['+1 magnet', '#ffb347'], slow: ['Slow time!', '#b69cff'] }[k];
+      burst(it.x, it.y, info[1], 18); pop(it.x, it.y - 10, info[0], info[1]);
+      if (k === 'heart') lives = Math.min(MAX_LIVES, lives + 1);
+      if (k === 'shield') shieldCh = Math.min(MAX_CHARGES, shieldCh + 1);
+      if (k === 'magnet') magnetCh = Math.min(MAX_CHARGES, magnetCh + 1);
+      if (k === 'slow') slow = 5;
+    } else {                                           // rock or comet
+      burst(it.x, it.y, '#ff6b3d', 22, 300);
+      if (shield > 0) { pop(it.x, it.y - 10, 'Blocked', '#7be7ff'); sfx.catch(0); return; }
+      lives--; combo = 0; shake = 14; flash = 1; sfx.hit(); vibrate(60);
+      if (lives <= 0) { state = 'dying'; dyingT = 0; burst(player.x, player.y, '#ffffff', 40, 380); sfx.over(); vibrate(150); }
+    }
+  }
+
+  function finishRun() {
+    state = 'over'; overT = 0; boss = null; ev = null; fireHeld = false;
+    const gain = score - run.awarded; run.awarded = score;
+    earned = (earned || 0) + gain;
+    save.stardust += gain;
+    save.totalStars += run.stars; save.games += 1;
+    save.bestCombo = Math.max(save.bestCombo, run.maxCombo);
+    newBest = score > save.best && score > 0;
+    if (newBest) save.best = score;
+    persist();
+    canRevive = !run.revived && Money.canRewarded() && (t - lastRewardOffer > 150);      // at most one offer every ~2.5 minutes
+    if (canRevive) lastRewardOffer = t;
+    if (newBest) Money.life('happytime');
+    try { window.ytgame && window.ytgame.engagement && window.ytgame.engagement.sendScore({ value: score }); } catch (e) {}
+  }
+  function revive() {
+    Money.rewarded('revive', () => {
+      run.revived = true; lives = 1; shield = 3; combo = 0; items = items.filter(i => !['rock', 'comet'].includes(i.kind));
+      state = 'playing'; startT = 0.8; sfx.power();
+    });
+  }
+  function playAgain() { if (locked()) { state = 'paywall'; return; } Money.interstitialThen(startRun); }
+  function playFromMenu() { if (locked()) { state = 'paywall'; return; } Money.interstitialThen(startRun, true); }
+  function unlockGame() {
+    save.unlocked = true; persist(); state = 'menu'; sfx.buy();
+    banner('FULL GAME UNLOCKED', 'Thank you! Enjoy playing', '#ffd166');
+  }
+  function buyUnlock() {
+    if (Money.canPurchase()) Money.purchase('unlock_full', ok => { if (ok) unlockGame(); else sfx.deny(); });
+    else if (UNLOCK_URL) { try { window.open(UNLOCK_URL, '_blank', 'noopener'); } catch (e) {} }     // web: send them to the full game
+  }
+  function restoreUnlock() { Money.restore(ok => { if (ok) unlockGame(); else { sfx.deny(); banner('Nothing to restore', '', '#b8c4d9'); } }); }
+
+  // ======================================================================
+  //  Input (multi-touch: one finger moves, another can hold FIRE)
+  // ======================================================================
+  function toLogical(e) {
+    const r = canvas.getBoundingClientRect();
+    return [((e.clientX - r.left) / r.width * canvas.width - ox) / scale, ((e.clientY - r.top) / r.height * canvas.height - oy) / scale];
+  }
+  function findUI(x, y) {
+    for (let i = ui.length - 1; i >= 0; i--) {
+      const b = ui[i];
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
+    }
+    return null;
+  }
+  canvas.addEventListener('pointerdown', e => {
+    unlockAudio();
+    const [gx, gy] = toLogical(e);
+    const b = findUI(gx, gy);
+    if (b) {
+      pressedKey = b.key;
+      if (b.hold) { fireId = e.pointerId; fireHeld = true; fireFromButton = true; } else b.cb();
+      return;
+    }
+    if (state === 'playing') {
+      if (e.pointerType === 'mouse') { fireId = e.pointerId; fireHeld = true; fireFromButton = false; pointerX = gx; }   // mouse: steer by hovering, hold click to fire
+      else { moveId = e.pointerId; pointerX = gx; }                                                                    // touch: drag to move
+    }
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (state !== 'playing') return;
+    if (e.pointerId === moveId) pointerX = toLogical(e)[0];
+    else if (e.pointerType === 'mouse' && (!fireHeld || !fireFromButton) && moveId === null) pointerX = toLogical(e)[0];   // desktop: hover to steer (also while holding click to fire)
+  });
+  function release(e) {
+    pressedKey = null;
+    if (e.pointerId === fireId) { fireHeld = false; fireId = null; }
+    if (e.pointerId === moveId) { moveId = null; if (e.pointerType !== 'mouse') pointerX = null; }
+  }
+  window.addEventListener('pointerup', release);
+  window.addEventListener('pointercancel', release);
+  window.addEventListener('keydown', e => {
+    unlockAudio(); keys[e.key] = true; keys[e.code] = true;                  // e.code = physical key, so WASD-style keys work on AZERTY etc.
+    if (e.key === ' ' || e.key.startsWith('Arrow')) e.preventDefault();      // never scroll the host page
+    if (e.key === ' ' || e.key === 'Enter') {
+      if (state === 'menu') { sfx.click(); playFromMenu(); } else if (state === 'over') playAgain(); else if (state === 'paused') state = 'playing';
+    }
+    const pauseKey = e.code === 'KeyP' || (e.key === 'Escape' && CFG.platform !== 'crazygames');   // Esc also leaves fullscreen, so not on CrazyGames
+    if (pauseKey && state === 'playing') state = 'paused';
+    else if (pauseKey && state === 'paused') state = 'playing';
+    if (e.code === 'KeyQ') useMagnet();
+    if (e.code === 'KeyE') useShield();
+    if (e.code === 'KeyM') save.music = !save.music, persist();
+  });
+  window.addEventListener('keyup', e => { keys[e.key] = false; keys[e.code] = false; });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { persist(); if (state === 'playing') state = 'paused'; } });
+  window.addEventListener('blur', () => { if (state === 'playing') state = 'paused'; fireHeld = false; });
+
+  // ======================================================================
+  //  Drawing helpers
+  // ======================================================================
+  function rr(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+  function text(str, x, y, size, color, align = 'center', weight = '800') {
+    ctx.font = `${weight} ${size}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+    ctx.textAlign = align; ctx.fillStyle = color; ctx.fillText(str, x, y);
+  }
+  // Small vector icons used on buttons.
+  function glyph(name, cx, cy, s, color) {
+    ctx.save(); ctx.translate(cx, cy); ctx.fillStyle = ctx.strokeStyle = color; ctx.lineWidth = s * 0.14; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    if (name === 'play') { ctx.beginPath(); ctx.moveTo(-s * 0.3, -s * 0.5); ctx.lineTo(s * 0.5, 0); ctx.lineTo(-s * 0.3, s * 0.5); ctx.closePath(); ctx.fill(); }
+    else if (name === 'cog') {
+      ctx.beginPath(); ctx.arc(0, 0, s * 0.3, 0, 6.3); ctx.stroke();
+      for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; ctx.beginPath(); ctx.moveTo(Math.cos(a) * s * 0.38, Math.sin(a) * s * 0.38); ctx.lineTo(Math.cos(a) * s * 0.54, Math.sin(a) * s * 0.54); ctx.stroke(); }
+    } else if (name === 'robot') {
+      ctx.beginPath(); ctx.arc(0, s * 0.08, s * 0.4, 0, 6.3); ctx.stroke(); ctx.beginPath(); ctx.moveTo(-s * 0.3, -s * 0.34); ctx.lineTo(s * 0.3, -s * 0.34); ctx.stroke();
+      ctx.beginPath(); ctx.arc(-s * 0.14, 0, s * 0.06, 0, 6.3); ctx.arc(s * 0.14, 0, s * 0.06, 0, 6.3); ctx.fill();
+    } else if (name === 'flag') {
+      ctx.beginPath(); ctx.moveTo(-s * 0.3, s * 0.5); ctx.lineTo(-s * 0.3, -s * 0.5); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-s * 0.3, -s * 0.5); ctx.lineTo(s * 0.45, -s * 0.28); ctx.lineTo(-s * 0.3, -s * 0.04); ctx.closePath(); ctx.fill();
+    } else if (name === 'video') {                                   // clapperboard: marks a rewarded ad button
+      ctx.beginPath(); ctx.rect(-s * 0.46, -s * 0.12, s * 0.92, s * 0.5); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-s * 0.46, -s * 0.12); ctx.lineTo(-s * 0.36, -s * 0.46); ctx.lineTo(s * 0.46, -s * 0.34); ctx.lineTo(s * 0.46, -s * 0.12); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,0.0)';
+    } else if (name === 'up') { ctx.beginPath(); ctx.moveTo(0, s * 0.45); ctx.lineTo(0, -s * 0.4); ctx.moveTo(-s * 0.32, -s * 0.08); ctx.lineTo(0, -s * 0.42); ctx.lineTo(s * 0.32, -s * 0.08); ctx.stroke(); }
+    ctx.restore();
+  }
+  // Glossy rounded button; presses in, can shine and pulse. Registers a hit area for this frame.
+  function btn(label, x, y, w, h, o, cb) {
+    o = o || {};
+    const key = label + '|' + Math.round(x) + '|' + Math.round(y), down = pressedKey === key;
+    const sc = (down ? 0.94 : 1) * (o.pulse ? 1 + 0.025 * Math.sin(t * 3.2) : 1);
+    const top = o.disabled ? '#5a6483' : o.top || '#8af0ff', bot = o.disabled ? '#3a4260' : o.bot || '#2aa6d0';
+    ctx.save(); ctx.translate(x, y + (down ? 2 : 0)); ctx.scale(sc, sc);
+    const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2); g.addColorStop(0, top); g.addColorStop(1, bot);
+    ctx.save(); ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = down ? 4 : 12; ctx.shadowOffsetY = down ? 1 : 5;
+    rr(-w / 2, -h / 2, w, h, h / 2.4); ctx.fillStyle = g; ctx.fill(); ctx.restore();
+    rr(-w / 2, -h / 2, w, h, h / 2.4); ctx.save(); ctx.clip();
+    ctx.fillStyle = 'rgba(255,255,255,0.22)'; rr(-w / 2 + 4, -h / 2 + 3, w - 8, h * 0.42, h / 3.2); ctx.fill();    // top gloss
+    if (o.shine && !o.disabled) {                                                                               // sweeping highlight
+      const p = (t * 0.45 + x * 0.003) % 2.2;
+      if (p < 1) { const sx = -w / 2 - 40 + p * (w + 80); ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.beginPath(); ctx.moveTo(sx, -h / 2); ctx.lineTo(sx + 26, -h / 2); ctx.lineTo(sx + 6, h / 2); ctx.lineTo(sx - 20, h / 2); ctx.closePath(); ctx.fill(); }
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 2; rr(-w / 2 + 1, -h / 2 + 1, w - 2, h - 2, h / 2.4); ctx.stroke();
+    const size = o.size || 24, ic = o.icon ? size * 0.9 : 0;
+    ctx.font = `800 ${size}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+    const tw = ctx.measureText(label).width, total = ic + (ic ? 8 : 0) + tw;
+    const col = o.color || '#07203a';
+    if (o.icon) glyph(o.icon, -total / 2 + ic / 2, 0, ic, col);
+    text(label, -total / 2 + ic + (ic ? 8 : 0) + tw / 2, size * 0.35, size, col);
+    ctx.restore();
+    ui.push({ x: x - w / 2 + uiDx, y: y - h / 2, w, h, key, cb: () => { if (!o.disabled) sfx.click(); cb(); } });
+  }
+  function iconBtn(x, y, r, drawIcon, cb) {
+    const key = 'icon|' + Math.round(x) + '|' + Math.round(y), down = pressedKey === key;
+    ctx.save(); ctx.translate(x, y); ctx.scale(down ? 0.9 : 1, down ? 0.9 : 1);
+    ctx.fillStyle = 'rgba(10,16,40,0.6)'; ctx.beginPath(); ctx.arc(0, 0, r, 0, 6.3); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 2; ctx.stroke();
+    drawIcon(0, 0); ctx.restore();
+    ui.push({ x: x - r - 4 + uiDx, y: y - r - 4, w: 2 * r + 8, h: 2 * r + 8, key, cb: () => { sfx.click(); cb(); } });
+  }
+  // Big round action button with an icon, progress ring and charge badge.
+  function actionBtn(key, cx, cy, r, o, cb) {
+    const down = pressedKey === key || o.held;
+    ctx.save(); ctx.translate(cx, cy); ctx.scale(down ? 0.92 : 1, down ? 0.92 : 1);
+    if (o.ready && !o.disabled) { ctx.shadowColor = o.color; ctx.shadowBlur = 16 + 6 * Math.sin(t * 5); }
+    ctx.fillStyle = 'rgba(10,16,40,0.8)'; ctx.beginPath(); ctx.arc(0, 0, r, 0, 6.3); ctx.fill(); ctx.shadowBlur = 0;
+    ctx.lineWidth = 4; ctx.strokeStyle = o.disabled ? 'rgba(255,255,255,0.18)' : o.color; ctx.beginPath(); ctx.arc(0, 0, r, 0, 6.3); ctx.stroke();
+    if (o.ring != null) { ctx.lineWidth = 5; ctx.strokeStyle = o.ringColor || '#fff'; ctx.beginPath(); ctx.arc(0, 0, r + 7, -Math.PI / 2, -Math.PI / 2 + 6.283 * Math.max(0.001, o.ring)); ctx.stroke(); }
+    ctx.globalAlpha = o.disabled ? 0.4 : 1; sprite(o.icon, 0, 0, r * 1.45, 0); ctx.globalAlpha = 1;
+    ctx.restore();
+    if (o.badge != null) {
+      ctx.fillStyle = o.badge > 0 ? '#ff5470' : '#4a5272'; ctx.beginPath(); ctx.arc(cx + r * 0.72, cy - r * 0.72, 12, 0, 6.3); ctx.fill();
+      text(String(o.badge), cx + r * 0.72, cy - r * 0.72 + 5, 14, '#fff');
+    }
+    if (o.label) text(o.label, cx, cy + r + 18, 11, '#b8c4d9', 'center', '700');
+    ui.push({ x: cx - r - 8 + uiDx, y: cy - r - 8, w: 2 * r + 16, h: 2 * r + 16, key, cb: cb || (() => {}), hold: !!o.hold });
+  }
+  const iconSpeaker = on => (x, y) => {
+    ctx.fillStyle = ctx.strokeStyle = on ? '#7be7ff' : '#6b7a99'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x - 9, y - 4); ctx.lineTo(x - 4, y - 4); ctx.lineTo(x + 1, y - 9); ctx.lineTo(x + 1, y + 9); ctx.lineTo(x - 4, y + 4); ctx.lineTo(x - 9, y + 4); ctx.closePath(); ctx.fill();
+    if (on) { ctx.beginPath(); ctx.arc(x + 2, y, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(x + 2, y, 11, -0.9, 0.9); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.moveTo(x + 6, y - 5); ctx.lineTo(x + 13, y + 5); ctx.moveTo(x + 13, y - 5); ctx.lineTo(x + 6, y + 5); ctx.stroke(); }
+  };
+  const iconNote = on => (x, y) => {
+    ctx.fillStyle = ctx.strokeStyle = on ? '#ffd166' : '#6b7a99'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(x - 4, y + 7, 5, 0, 6.3); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x + 1, y + 6); ctx.lineTo(x + 1, y - 10); ctx.lineTo(x + 10, y - 6); ctx.stroke();
+    if (!on) { ctx.strokeStyle = '#ff7a8a'; ctx.beginPath(); ctx.moveTo(x - 12, y + 12); ctx.lineTo(x + 12, y - 12); ctx.stroke(); }
+  };
+  const iconPause = (x, y) => { ctx.fillStyle = '#e6edf7'; ctx.fillRect(x - 8, y - 9, 6, 18); ctx.fillRect(x + 3, y - 9, 6, 18); };
+
+  function drawNebula(img, alpha) {
+    if (!img) return;
+    ctx.globalAlpha = alpha;
+    const base = Math.floor(bgY / H), frac = bgY - base * H;       // mirrored tiles scroll with no seam
+    for (let i = -1; i <= 0; i++) {
+      const y = frac + i * H;
+      if (((base - i) & 1) === 0) ctx.drawImage(img, 0, y, W, H);
+      else { ctx.save(); ctx.translate(0, y + H); ctx.scale(1, -1); ctx.drawImage(img, 0, 0, W, H); ctx.restore(); }
+    }
+    ctx.globalAlpha = 1;
+  }
+  // The robot with its equipment bolted on (guns, magnet coil, shield core).
+  function drawCatcher(img, x, y, h, rot, bob, equip) {
+    ctx.save(); ctx.translate(x, y + bob); ctx.rotate(rot);
+    if (img) {
+      const w = h * img.width / img.height;
+      if (equip) drawGearBack(w, h);
+      ctx.drawImage(img, -w / 2, -h / 2, w, h);
+      if (equip) drawGearFront(w, h);
+    } else { ctx.fillStyle = '#5ee6ff'; ctx.fillRect(-45, -h / 2, 90, h / 2); }
+    ctx.restore();
+  }
+  function drawGearBack(w, h) {
+    const b = gl('blaster');
+    if (b > 0) {                                                  // side cannons, bigger with each level
+      const s = h * (0.3 + 0.05 * b);
+      for (const sd of [-1, 1]) {
+        ctx.save(); ctx.translate(sd * w * 0.5, h * 0.06); ctx.rotate(sd * 0.1);
+        sprite('gear_blaster', 0, 0, s, 0);
+        if (muzzle > 0) { const g = ctx.createRadialGradient(0, -s * 0.5, 2, 0, -s * 0.5, 26); g.addColorStop(0, 'rgba(255,255,255,0.95)'); g.addColorStop(1, 'rgba(120,230,255,0)'); ctx.fillStyle = g; ctx.fillRect(-26, -s * 0.5 - 26, 52, 52); }
+        ctx.restore();
+      }
+    }
+  }
+  function drawGearFront(w, h) {
+    const m = gl('magnet'), sh = gl('shield');
+    if (m > 0) {                                                  // glowing coil ring around the bowl rim
+      ctx.save(); ctx.lineWidth = 3 + m; ctx.strokeStyle = `rgba(255,140,100,${0.55 + 0.25 * Math.sin(t * 6)})`;
+      ctx.shadowColor = '#ff7a5c'; ctx.shadowBlur = 10 + m * 3;
+      ctx.beginPath(); ctx.ellipse(0, -h * 0.5 + h * 0.13, w * 0.46, h * 0.075, 0, 0, 6.3); ctx.stroke(); ctx.restore();
+      sprite('gear_magnet', -w * 0.5, -h * 0.34, h * 0.24, -0.3);
+    }
+    if (sh > 0) sprite('gear_shield', 0, h * 0.37, h * 0.2, 0);
+    if (gl('plating') > 0) sprite('gear_plating', w * 0.5, -h * 0.3, h * 0.22, 0.25);
+  }
+  function orb(x, y, color, glyphName) {
+    const g = ctx.createRadialGradient(x - 5, y - 6, 3, x, y, 26);
+    g.addColorStop(0, '#ffffff'); g.addColorStop(0.35, color); g.addColorStop(1, 'rgba(0,0,0,0.35)');
+    ctx.save(); ctx.shadowColor = color; ctx.shadowBlur = 20; ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, 22 + Math.sin(t * 8) * 1.5, 0, 6.3); ctx.fill(); ctx.restore();
+    ctx.strokeStyle = '#0b1020'; ctx.fillStyle = '#0b1020'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    if (glyphName === 'heart') text('♥', x, y + 8, 24, '#0b1020');
+    else if (glyphName === 'shield') { ctx.beginPath(); ctx.moveTo(x, y - 10); ctx.lineTo(x + 9, y - 6); ctx.lineTo(x + 7, y + 5); ctx.lineTo(x, y + 11); ctx.lineTo(x - 7, y + 5); ctx.lineTo(x - 9, y - 6); ctx.closePath(); ctx.fill(); }
+    else if (glyphName === 'magnet') { ctx.beginPath(); ctx.arc(x, y - 1, 8, Math.PI, 0); ctx.moveTo(x - 8, y - 1); ctx.lineTo(x - 8, y + 8); ctx.moveTo(x + 8, y - 1); ctx.lineTo(x + 8, y + 8); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.arc(x, y, 9, 0, 6.3); ctx.stroke(); ctx.beginPath(); ctx.moveTo(x, y - 6); ctx.lineTo(x, y); ctx.lineTo(x + 5, y + 3); ctx.stroke(); }
+  }
+  function sprite(key, x, y, size, rot) {
+    const im = IMG[key];
+    ctx.save(); ctx.translate(x, y); ctx.rotate(rot || 0);
+    if (im) { const w = im.width >= im.height ? size : size * im.width / im.height, hh = im.width >= im.height ? size * im.height / im.width : size; ctx.drawImage(im, -w / 2, -hh / 2, w, hh); }
+    else { ctx.fillStyle = key === 'star' ? '#ffd166' : '#ff5470'; ctx.beginPath(); ctx.arc(0, 0, size / 3, 0, 6.3); ctx.fill(); }
+    ctx.restore();
+  }
+
+  // ======================================================================
+  //  Drawing: world, HUD, screens
+  // ======================================================================
+  function drawWorld() {
+    const sx = shake ? rand(-shake, shake) : 0, sy = shake ? rand(-shake, shake) : 0;
+    ctx.setTransform(scale, 0, 0, scale, ox + sx * scale, oy + sy * scale);
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+    if (bgFade < 1) drawNebula(bgFor(bgPrev), 1);
+    drawNebula(bgFor(bgCur), bgFade);
+    if (!bgFor(bgCur)) { ctx.fillStyle = '#121a33'; ctx.fillRect(0, 0, W, H); }
+    ctx.fillStyle = '#fff';
+    for (const s of bgStars) { ctx.globalAlpha = 0.25 + s.z * 0.4; ctx.fillRect(s.x, s.y, 2 * s.z, 2 * s.z); }
+    ctx.globalAlpha = 1;
+    if (slow > 0) { ctx.fillStyle = 'rgba(150,130,255,0.10)'; ctx.fillRect(0, 0, W, H); }
+
+    const inRun = state === 'playing' || state === 'dying' || state === 'paused';
+    const sk = curSkin(), catchY = player.y - player.h / 2 + player.h * sk.rim;
+
+    // magnet field: expanding rings + beams to every item being pulled
+    if (inRun && (magnet > 0 || passiveRadius() > 0)) {
+      const R = magnet > 0 ? magnetRadius() : passiveRadius(), col = magnet > 0 ? '255,150,100' : '255,150,110';
+      for (let k = 0; k < 3; k++) {
+        const ph = ((t * (magnet > 0 ? 0.9 : 0.5) + k / 3) % 1);
+        ctx.strokeStyle = `rgba(${col},${(1 - ph) * (magnet > 0 ? 0.42 : 0.2)})`; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(player.x, catchY, R * (1 - ph), 0, 6.3); ctx.stroke();
+      }
+      for (const it of items) if (it.pulled) {
+        const g = ctx.createLinearGradient(it.x, it.y, player.x, catchY);
+        g.addColorStop(0, `rgba(${col},0.5)`); g.addColorStop(1, `rgba(${col},0)`);
+        ctx.strokeStyle = g; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(it.x, it.y);
+        ctx.quadraticCurveTo((it.x + player.x) / 2 + Math.sin(t * 9 + it.x) * 14, (it.y + catchY) / 2, player.x, catchY); ctx.stroke();
+        if (Math.random() < 0.5) parts.push({ x: it.x, y: it.y, vx: (player.x - it.x) * 1.4, vy: (catchY - it.y) * 1.4, life: 0.25, max: 0.25, c: '#ffc09a', r: 2.5 });
+      }
+    }
+
+    // shower safe-lane hint
+    if (ev && ev.phase === 'on') {
+      const g = ctx.createLinearGradient(ev.lane - 95, 0, ev.lane + 95, 0);
+      g.addColorStop(0, 'rgba(255,209,102,0)'); g.addColorStop(0.5, 'rgba(255,209,102,0.10)'); g.addColorStop(1, 'rgba(255,209,102,0)');
+      ctx.fillStyle = g; ctx.fillRect(ev.lane - 95, 0, 190, H);
+    }
+
+    // boss
+    if (boss && inRun) {
+      const b = boss;
+      const glow = ctx.createRadialGradient(b.x, b.y, 10, b.x, b.y, b.r * 1.7);
+      glow.addColorStop(0, 'rgba(255,110,40,0.4)'); glow.addColorStop(1, 'rgba(255,110,40,0)');
+      ctx.fillStyle = glow; ctx.fillRect(b.x - b.r * 1.7, b.y - b.r * 1.7, b.r * 3.4, b.r * 3.4);
+      sprite('boss', b.x, b.y + Math.sin(t * 3) * 4, b.r * 2.5, Math.sin(t * 1.5) * 0.06);
+      if (b.flash > 0) { ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.55; sprite('boss', b.x, b.y + Math.sin(t * 3) * 4, b.r * 2.5, Math.sin(t * 1.5) * 0.06); ctx.restore(); }
+      const bw = 170, bx = b.x - bw / 2, by = b.y - b.r - 28;
+      rr(bx, by, bw, 12, 6); ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fill();
+      rr(bx + 2, by + 2, Math.max(8, (bw - 4) * Math.max(0, b.hp) / b.max), 8, 4); ctx.fillStyle = '#ff5a3c'; ctx.fill();
+    }
+
+    const showItems = inRun;
+    for (const it of showItems ? items : []) {
+      const k = it.kind;
+      if (k === 'star' || k === 'big') {
+        const big = k === 'big', rad = big ? 70 : 46;
+        const g = ctx.createRadialGradient(it.x, it.y, 4, it.x, it.y, rad);
+        g.addColorStop(0, big ? 'rgba(255,243,176,0.6)' : 'rgba(255,209,102,0.45)'); g.addColorStop(1, 'rgba(255,209,102,0)');
+        ctx.fillStyle = g; ctx.fillRect(it.x - rad, it.y - rad, rad * 2, rad * 2);
+        sprite('star', it.x, it.y, big ? 86 + Math.sin(t * 6) * 4 : 58, it.rot * 0.3);
+        if (big) { ctx.strokeStyle = 'rgba(255,243,176,0.7)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(it.x, it.y, 44 + Math.sin(t * 6) * 3, 0, 6.3); ctx.stroke(); }
+      } else if (k === 'rock') sprite('rock', it.x, it.y, it.r * 2.6, it.rot);
+      else if (k === 'comet') {
+        const g = ctx.createLinearGradient(0, it.y - 120, 0, it.y);
+        g.addColorStop(0, 'rgba(255,120,60,0)'); g.addColorStop(1, 'rgba(255,170,90,0.85)');
+        ctx.fillStyle = g; ctx.fillRect(it.x - 9, it.y - 120, 18, 120);
+        sprite('rock', it.x, it.y, 44, it.rot);
+      } else orb(it.x, it.y, { heart: '#ff7aa2', shield: '#7be7ff', magnet: '#ffb347', slow: '#b69cff' }[k], k);
+    }
+
+    // blaster bolts
+    for (const b of bolts) {
+      const g = ctx.createLinearGradient(b.x, b.y, b.x, b.y + 40); g.addColorStop(0, 'rgba(160,240,255,0.95)'); g.addColorStop(1, 'rgba(160,240,255,0)');
+      ctx.fillStyle = g; ctx.fillRect(b.x - 3, b.y, 6, 40);
+      ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, 6.3); ctx.fill();
+    }
+
+    if (inRun) {
+      const pulse = 0.16 + 0.16 * Math.pow(1 - ((t * 100 / 60) % 1), 2);        // glow breathes at ~100 BPM
+      const gl2 = ctx.createRadialGradient(player.x, player.y, 10, player.x, player.y, 150);
+      gl2.addColorStop(0, `rgba(123,231,255,${pulse * 1.6})`); gl2.addColorStop(1, 'rgba(123,231,255,0)');
+      ctx.fillStyle = gl2; ctx.fillRect(player.x - 150, player.y - 150, 300, 300);
+      if (shield > 0) { ctx.strokeStyle = `rgba(123,231,255,${0.4 + 0.3 * Math.sin(t * 10)})`; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(player.x, player.y, 98, 0, 6.3); ctx.stroke();
+        ctx.fillStyle = 'rgba(123,231,255,0.07)'; ctx.fill(); }
+      drawCatcher(playerImg(), player.x, player.y, player.h, Math.max(-0.25, Math.min(0.25, player.vx / 2200)), Math.sin(t * 3) * 3, true);
+    }
+
+    for (const p of parts) { ctx.globalAlpha = Math.max(0, p.life / p.max); ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); ctx.fill(); }
+    ctx.globalAlpha = 1;
+    for (const p of pops) { ctx.globalAlpha = Math.min(1, p.life * 2); text(p.text, p.x, p.y, 22, p.color); }
+    ctx.globalAlpha = 1;
+
+    if (ev && (ev.phase === 'warn' || ev.phase === 'bosswarn')) {                 // red alert vignette
+      const a = 0.10 + 0.10 * Math.abs(Math.sin(t * 8));
+      ctx.fillStyle = `rgba(255,40,40,${a})`; ctx.fillRect(0, 0, W, H);
+      text(ev.phase === 'warn' ? '⚠ METEOR SHOWER ⚠' : '⚠ TITAN INCOMING ⚠', W / 2, 330, 30, '#ffb3b3');
+    }
+    if (flash > 0) { ctx.fillStyle = `rgba(255,60,60,${flash * 0.35})`; ctx.fillRect(0, 0, W, H); }
+  }
+
+  function drawHUD() {
+    for (let i = 0; i < lives; i++) text('♥', 20 + i * 26, 44, 26, '#ff7aa2', 'left');
+    text(String(score), W / 2, 62, 54, '#ffffff');
+    text('LEVEL ' + level, W / 2, 86, 14, '#9fb0d0', 'center', '700');
+    // combo meter
+    const m = mult(), into = m >= 5 ? 5 : combo % 5;
+    rr(W / 2 - 50, 96, 100, 8, 4); ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fill();
+    if (into > 0 || combo > 0) { rr(W / 2 - 50, 96, 100 * (m >= 5 ? 1 : into / 5), 8, 4); ctx.fillStyle = '#ffd166'; ctx.fill(); }
+    if (m > 1) text('x' + m, W / 2 + 64, 105, 18, '#ffd166', 'left');
+    // active effect timers
+    let py = 70;
+    for (const [label, val, max, col] of [['SHIELD', shield, shieldDur(), '#7be7ff'], ['MAGNET', magnet, magnetDur(), '#ffb347'], ['SLOW', slow, 5, '#b69cff']]) {
+      if (val <= 0) continue;
+      text(label, 20, py, 11, col, 'left', '700');
+      rr(20, py + 4, 60, 5, 2.5); ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fill();
+      rr(20, py + 4, 60 * Math.min(1, val / max), 5, 2.5); ctx.fillStyle = col; ctx.fill();
+      py += 26;
+    }
+    if (state === 'playing') iconBtn(W - 34, 38, 20, iconPause, () => { state = 'paused'; });
+
+    // action buttons (bottom strip)
+    if (state === 'playing' || state === 'paused') {
+      const cool = overheat ? '#ff5a3c' : '#ffb02e';
+      actionBtn('act_magnet', 62, 664, 31, { icon: 'gear_magnet', color: '#ff7a5c', badge: magnetCh, disabled: magnetCh <= 0, ready: magnetCh > 0 && magnet <= 0,
+        ring: magnet > 0 ? magnet / magnetDur() : null, ringColor: '#ffb347', label: 'MAGNET' }, useMagnet);
+      actionBtn('act_shield', 142, 664, 31, { icon: 'gear_shield', color: '#7be7ff', badge: shieldCh, disabled: shieldCh <= 0, ready: shieldCh > 0 && shield <= 0,
+        ring: shield > 0 ? shield / shieldDur() : null, ringColor: '#7be7ff', label: 'SHIELD' }, useShield);
+      actionBtn('act_fire', W - 68, 656, 41, { icon: 'gear_blaster', color: cool, disabled: false, ready: !overheat && energy > 20, held: fireHeld,
+        ring: energy / 100, ringColor: overheat ? '#ff5a3c' : '#6be8ff', hold: true, label: overheat ? 'COOLING…' : 'FIRE' });
+    }
+
+    if (startT > 0 && state === 'playing') text('GET READY', W / 2, 330, 40, '#ffffff');
+    if (hintT > 0 && state === 'playing' && startT <= 0) {            // visual onboarding: one step at a time, ends as soon as they do it
+      ctx.globalAlpha = Math.min(1, hintT);
+      const pulse = Math.sin(t * 6);
+      if (!tutMoved) {                                                  // step 1: how to move
+        const y = player.y - 175;                                       // well above the robot so nothing overlaps it
+        ctx.fillStyle = '#ffffff';
+        for (const d of [-1, 1]) { const x = player.x + d * (78 + 6 * pulse); ctx.beginPath(); ctx.moveTo(x + d * 18, y); ctx.lineTo(x, y - 14); ctx.lineTo(x, y + 14); ctx.closePath(); ctx.fill(); }
+        if (COARSE) text('DRAG', player.x, y + 7, 20, '#ffffff');
+        else {
+          for (const [d, ch] of [[-1, '←'], [1, '→']]) {                // keyboard overlay
+            const kx = player.x + d * 24; rr(kx - 18, y - 18, 36, 36, 8); ctx.fillStyle = 'rgba(255,255,255,0.2)'; ctx.fill();
+            ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 2; ctx.stroke(); text(ch, kx, y + 8, 22, '#ffffff');
+          }
+          text('or move the mouse', player.x, y + 48, 14, '#b8c4d9', 'center', '600');
+        }
+      } else if (!tutFired) {                                           // step 2: how to fire
+        const fx = W - 68, fy = 656;
+        ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(fx, fy, 52 + 5 * pulse, 0, 6.3); ctx.stroke();
+        text(COARSE ? 'HOLD' : 'HOLD CLICK / SPACE', fx - (COARSE ? 0 : 40), fy - 70, 15, '#ffd166');
+      }
+      ctx.globalAlpha = 1;
+    }
+    for (let i = 0; i < banners.length; i++) {
+      const b = banners[i], k = b.life / b.max, a = Math.min(1, k * 3, (1 - k) * 6 + 0.01), s = 0.85 + 0.15 * Math.min(1, (1 - k) * 8);
+      ctx.save(); ctx.globalAlpha = Math.max(0, Math.min(1, a)); ctx.translate(W / 2, 400 + i * 70); ctx.scale(s, s);
+      text(b.text, 0, 0, 44, b.color); if (b.sub) text(b.sub, 0, 30, 18, '#e6edf7', 'center', '600');
+      ctx.restore();
+    }
+  }
+
+  function dim(a) { ctx.fillStyle = `rgba(5,8,20,${a})`; ctx.fillRect(-uiDx, 0, FW, H); }
+  function dust(x, y, align) { text('✦ ' + save.stardust, x, y, 22, '#ffd166', align); }
+  function canUpgradeAny() { return GEAR.some(g => { const lv = gl(g.id); return lv < 3 && save.stardust >= g.costs[lv]; }); }
+
+  function drawMenu() {
+    dim(0.55);
+    dust(20, 44, 'left');
+    if (trialOn()) text(trialLeft() > 0 ? 'FREE TRIAL  ' + mmss(trialLeft()) + ' left' : 'TRIAL ENDED', 20, 70, 14, trialLeft() > 0 ? '#7be79a' : '#ff9aa8', 'left', '700');
+    iconBtn(W - 34, 38, 20, iconSpeaker(save.sfx), () => { save.sfx = !save.sfx; persist(); });
+    iconBtn(W - 84, 38, 20, iconNote(save.music), () => { save.music = !save.music; persist(); });
+    const bob = Math.sin(t * 2) * 6;
+    text('STAR', W / 2, 170 + bob * 0.3, 76, '#ffd166'); text('CATCHER', W / 2, 236 + bob * 0.3, 56, '#7be7ff');
+    drawCatcher(playerImg(), W / 2, 382, 185, 0, bob, true);
+    if (save.best) text('BEST  ' + save.best, W / 2, 513, 20, '#ffd166');
+    btn('PLAY', W / 2, 565, 260, 68, { size: 32, top: '#ffe08a', bot: '#ffb02e', icon: 'play', shine: true, pulse: true }, playFromMenu);
+    btn('SKINS', 90, 645, 140, 50, { size: 17, icon: 'robot' }, () => goto('shop'));
+    btn('GEAR', W / 2, 645, 140, 50, { size: 17, icon: 'cog', top: '#ffc58a', bot: '#e8782e' }, () => goto('gear'));
+    btn('MISSIONS', W - 90, 645, 140, 50, { size: 15, icon: 'flag' }, () => goto('missions'));
+    ensureMissions();
+    const open = save.missions.list.filter(m => !m.done).length;
+    if (open > 0) { ctx.fillStyle = '#ff5470'; ctx.beginPath(); ctx.arc(W - 30, 625, 11, 0, 6.3); ctx.fill(); text(String(open), W - 30, 630, 14, '#fff'); }
+    if (canUpgradeAny()) { ctx.fillStyle = '#7be79a'; ctx.beginPath(); ctx.arc(W / 2 + 60, 625, 11, 0, 6.3); ctx.fill(); text('!', W / 2 + 60, 630, 15, '#06310f'); }
+  }
+
+  function drawShop() {
+    dim(0.78);
+    text('SKINS', W / 2, 80, 44, '#7be7ff'); dust(W / 2, 118, 'center');
+    const pos = [[135, 246], [345, 246], [135, 490], [345, 490]];
+    SKINS.forEach((s, i) => {
+      const [cx, cy] = pos[i], owned = save.owned.includes(s.id), eq = save.skin === s.id;
+      const dx = denyShake > 0 && s.id === shopDeny ? Math.sin(t * 60) * 5 : 0;
+      ctx.save(); ctx.translate(dx, 0);
+      rr(cx - 100, cy - 115, 200, 230, 22); ctx.fillStyle = eq ? 'rgba(255,209,102,0.16)' : 'rgba(255,255,255,0.07)'; ctx.fill();
+      ctx.strokeStyle = eq ? '#ffd166' : 'rgba(255,255,255,0.2)'; ctx.lineWidth = eq ? 3 : 1.5; ctx.stroke();
+      drawCatcher(IMG[s.img], cx, cy - 32, 120, 0, 0, false);
+      text(s.name, cx, cy + 50, 20, '#ffffff');
+      if (eq) text('EQUIPPED', cx, cy + 92, 18, '#ffd166');
+      else if (owned) btn('SELECT', cx, cy + 86, 140, 38, { size: 18 }, () => { save.skin = s.id; persist(); });
+      else btn('✦ ' + s.price, cx, cy + 86, 140, 38, { size: 18, top: '#ffe08a', bot: '#ffb02e', disabled: save.stardust < s.price }, () => {
+        if (save.stardust >= s.price) { save.stardust -= s.price; save.owned.push(s.id); save.skin = s.id; persist(); sfx.buy(); burst(cx, cy, '#ffd166', 30, 300); }
+        else { sfx.deny(); denyShake = 0.4; shopDeny = s.id; }
+      });
+      ctx.restore();
+    });
+    text('Earn stardust by playing and finishing missions', W / 2, 636, 14, '#9fb0d0', 'center', '600');
+    btn('BACK', W / 2, 675, 180, 46, { size: 20 }, () => goto('menu'));
+  }
+
+  function drawGear() {
+    dim(0.8);
+    text('GEAR', W / 2, 62, 40, '#ffb02e'); dust(W - 20, 62, 'right');
+    drawCatcher(playerImg(), W / 2, 160, 128, 0, Math.sin(t * 2) * 3, true);       // preview of the robot carrying the equipment
+    GEAR.forEach((g, i) => {
+      const y = 300 + i * 96, lv = gl(g.id), maxed = lv >= 3, cost = g.costs[lv] || 0;
+      const dx = denyShake > 0 && g.id === gearDeny ? Math.sin(t * 60) * 5 : 0;
+      ctx.save(); ctx.translate(dx, 0);
+      rr(24, y - 42, 432, 86, 18); ctx.fillStyle = 'rgba(255,255,255,0.07)'; ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1.5; ctx.stroke();
+      sprite(g.img, 68, y, 62, 0);
+      text(g.name, 112, y - 12, 19, '#ffffff', 'left');
+      text(g.fx[lv] || '', 112, y + 8, 13, '#b8c4d9', 'left', '600');
+      for (let p = 0; p < 3; p++) { ctx.fillStyle = p < lv ? g.color : 'rgba(255,255,255,0.18)'; ctx.beginPath(); ctx.arc(120 + p * 22, y + 29, 7, 0, 6.3); ctx.fill(); }
+      if (maxed) text('MAX', 392, y + 8, 20, '#7be79a');
+      else btn('✦ ' + cost, 392, y, 124, 44, { size: 17, icon: 'up', top: '#ffc58a', bot: '#e8782e', disabled: save.stardust < cost }, () => {
+        if (save.stardust >= cost) { save.stardust -= cost; save.gear[g.id] = lv + 1; persist(); sfx.buy(); burst(68, y, g.color, 26, 260); }
+        else { sfx.deny(); denyShake = 0.4; gearDeny = g.id; }
+      });
+      ctx.restore();
+    });
+    btn('BACK', W / 2, 690, 180, 44, { size: 20 }, () => goto('menu'));
+  }
+
+  function drawMissions() {
+    dim(0.78);
+    text('DAILY MISSIONS', W / 2, 90, 38, '#7be7ff');
+    ensureMissions();
+    save.missions.list.forEach((m, i) => {
+      const y = 190 + i * 118, def = MISSION_TYPES.find(x => x.type === m.type);
+      rr(30, y - 44, 420, 96, 18); ctx.fillStyle = m.done ? 'rgba(120,230,150,0.14)' : 'rgba(255,255,255,0.07)'; ctx.fill();
+      ctx.strokeStyle = m.done ? '#7be79a' : 'rgba(255,255,255,0.2)'; ctx.lineWidth = 1.5; ctx.stroke();
+      text(def.text(m.target), 48, y - 10, 20, '#fff', 'left');
+      text(m.done ? 'DONE ✓' : '+' + m.reward + ' ✦', 432, y - 10, 18, m.done ? '#7be79a' : '#ffd166', 'right');
+      rr(48, y + 10, 384, 14, 7); ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fill();
+      if (m.progress > 0) { rr(48, y + 10, Math.max(14, 384 * m.progress / m.target), 14, 7); ctx.fillStyle = m.done ? '#7be79a' : '#ffd166'; ctx.fill(); }
+      text(Math.floor(m.progress) + ' / ' + m.target, 432, y + 42, 13, '#b8c4d9', 'right', '600');
+    });
+    text('New missions every day', W / 2, 590, 15, '#9fb0d0', 'center', '600');
+    btn('BACK', W / 2, 675, 180, 46, { size: 20 }, () => goto('menu'));
+  }
+
+  function drawPaywall() {
+    dim(0.84);
+    text('TRIAL ENDED', W / 2, 150, 48, '#ffd166');
+    text('You played ' + TRIAL_MIN + ' minutes for free.', W / 2, 200, 20, '#fff', 'center', '700');
+    const store = Money.canPurchase();
+    text(store ? 'Unlock the full game once and play forever.' : 'Get the full game to keep playing.', W / 2, 232, 17, '#e6edf7', 'center', '600');
+    if (store) text('Your stardust, gear and skins are kept.', W / 2, 262, 15, '#b8c4d9', 'center', '600');
+    drawCatcher(playerImg(), W / 2, 400, 170, 0, Math.sin(t * 2) * 5, true);
+    const price = Money.price('unlock_full');
+    btn(store ? 'UNLOCK FULL GAME' + (price ? '  ·  ' + price : '') : 'GET THE FULL GAME', W / 2, 535, 340, 68, { size: 21, top: '#b6ffb0', bot: '#2fb344', shine: true, pulse: true }, buyUnlock);
+    if (store) btn('RESTORE PURCHASE', W / 2, 610, 260, 44, { size: 16 }, restoreUnlock);
+    btn('MENU', W / 2, store ? 668 : 620, 160, 40, { size: 17 }, () => { state = 'menu'; });
+  }
+
+  function drawPaused() {
+    dim(0.7);
+    text('PAUSED', W / 2, 230, 56, '#fff');
+    btn('RESUME', W / 2, 330, 240, 60, { size: 28, top: '#ffe08a', bot: '#ffb02e', icon: 'play', shine: true }, () => { state = 'playing'; });
+    btn('Music: ' + (save.music ? 'ON' : 'OFF'), W / 2, 410, 240, 48, { size: 20 }, () => { save.music = !save.music; persist(); });
+    btn('Sound: ' + (save.sfx ? 'ON' : 'OFF'), W / 2, 475, 240, 48, { size: 20 }, () => { save.sfx = !save.sfx; persist(); });
+    btn('QUIT TO MENU', W / 2, 550, 240, 48, { size: 20, top: '#ff9aa8', bot: '#d63e58' }, () => { state = 'menu'; });
+    text('Free MAGNET and SHIELD charges', W / 2, 612, 14, '#ffd166', 'center', '700');
+    text('combo of 10 · clear a level · blast 8 meteors', W / 2, 634, 13, '#b8c4d9', 'center', '600');
+    text('beat a boss · first run of the day', W / 2, 654, 13, '#b8c4d9', 'center', '600');
+  }
+
+  function drawOver() {
+    dim(0.68);
+    const k = Math.min(1, overT * 3);
+    ctx.save(); ctx.globalAlpha = k; ctx.translate(0, (1 - k) * 30);
+    text('GAME OVER', W / 2, 175, 54, '#ff7aa2');
+    text(String(score), W / 2, 285, 110, '#fff');
+    text(newBest ? 'NEW BEST!' : 'BEST  ' + save.best, W / 2, 330, 24, '#ffd166');
+    const shown = Math.min(earned, Math.floor(overT * 60));
+    text('+' + shown + ' ✦', W / 2, 378, 34, '#ffd166');
+    text(`Stars ${run.stars}  ·  Blasted ${run.kills}  ·  Combo ${run.maxCombo}  ·  Level ${level}`, W / 2, 412, 15, '#b8c4d9', 'center', '600');
+    let y = 480;
+    // REVIVE and PLAY AGAIN share size, font and colour on purpose (CrazyGames and Poki: the "continue without the ad" option must match the offer). Not green; video icon on the ad button.
+    const same = { size: 22, top: '#ffe08a', bot: '#ffb02e', shine: true };
+    if (canRevive) { btn('REVIVE  (watch ad)', W / 2, y, 300, 60, Object.assign({ icon: 'video' }, same), revive); y += 76; }
+    btn('PLAY AGAIN', W / 2, y, 300, 60, Object.assign({ icon: 'play' }, same), playAgain);
+    btn('MENU', W / 2, y + 76, 200, 46, { size: 20 }, () => { state = 'menu'; });
+    ctx.restore();
+  }
+
+  function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#070a18'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const bgImg = bgFor(bgCur);
+    if (bgImg) {   // dimmed nebula in the area outside the play-field (when the window is not exactly the field's shape)
+      const s = Math.max(canvas.width / bgImg.width, canvas.height / bgImg.height), bw = bgImg.width * s, bh = bgImg.height * s;
+      ctx.globalAlpha = 0.45; ctx.drawImage(bgImg, (canvas.width - bw) / 2, (canvas.height - bh) / 2, bw, bh); ctx.globalAlpha = 1;
+    }
+    ui = [];
+    drawWorld();
+    if (state === 'playing' || state === 'dying' || state === 'paused') drawHUD();
+    const screens = { menu: drawMenu, shop: drawShop, gear: drawGear, missions: drawMissions, paywall: drawPaywall, paused: drawPaused, over: drawOver,
+      loading: () => { dim(0.6); text('Loading…', W / 2, H / 2, 28, '#fff'); } };
+    if (screens[state]) {
+      const real = W; W = UW; uiDx = (real - UW) / 2;           // menus are laid out for 480 wide: centre that column
+      ctx.save(); ctx.translate(uiDx, 0); screens[state](); ctx.restore();
+      W = real; uiDx = 0;
+    }
+    ctx.restore();
+  }
+
+  // ======================================================================
+  //  Main loop + YouTube Playables lifecycle
+  // ======================================================================
+  let last = performance.now(), firstFrame = false, wasPlaying = false;
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now; t += dt;
+    if (wantFW !== FW && state !== 'playing' && state !== 'dying' && state !== 'paused') {      // portrait <-> landscape, between runs only
+      FW = W = wantFW; fit(); player.x = FW / 2; pointerX = null;
+      for (const st of bgStars) st.x = Math.random() * FW;
+    }
+    parts = parts.filter(p => (p.life -= dt) > 0);
+    for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt; }
+    pops = pops.filter(p => (p.life -= dt) > 0);
+    for (const p of pops) p.y -= 40 * dt;
+    banners = banners.filter(b => (b.life -= dt) > 0);
+    shake = Math.max(0, shake - dt * 30); flash = Math.max(0, flash - dt * 3); denyShake = Math.max(0, denyShake - dt);
+    if (state === 'over') overT += dt;
+    if (state === 'playing' || state === 'dying') world(dt);
+    else if (state !== 'paused') bgY = (bgY + dt * 30) % (2 * H);
+    for (const s of bgStars) { s.y += dt * 60 * s.z; if (s.y > H) { s.y = -4; s.x = Math.random() * W; } }
+    draw(); syncMusic();
+    const nowPlaying = state === 'playing';            // tell the provider when real gameplay starts / stops
+    if (nowPlaying !== wasPlaying) { wasPlaying = nowPlaying; Money.life(nowPlaying ? 'gameplayStart' : 'gameplayStop'); }
+    if (!firstFrame) {
+      firstFrame = true;
+      try { window.ytgame && window.ytgame.game.firstFrameReady(); } catch (e) { console.warn(e); }
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // Interactive once assets are in: tell YouTube (order: firstFrameReady -> gameReady).
+  const providerReady = () => { const p = Money.provider; return p && p.ready ? Promise.race([p.ready, new Promise(r => setTimeout(r, 4000))]) : Promise.resolve(); };
+  Promise.all([loaded, providerReady()]).then(() => {
+    if (provStore()) save = loadSave();                            // e.g. CrazyGames cloud save replaces the local one
+    ensureMissions();
+    state = 'menu';
+    Money.life('loadingFinished');
+    if (AUTOSTART) startRun();                                     // menu stays reachable from pause and game over
+    const signal = () => { try { window.ytgame && window.ytgame.game.gameReady(); } catch (e) { console.warn(e); } };
+    firstFrame ? signal() : requestAnimationFrame(() => requestAnimationFrame(signal));
+  });
+
+})();
+</script>
+</body>
+</html>
